@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+# マージ済みかつクリーンな gwq worktree を一括削除する。
+#
+# 既定は dry-run。`--apply` で `gwq remove -b` を実行する (リモートブランチは消さない)。
+# マージ判定の既定は「tip がベースの祖先」。squash/rebase マージは `--squash-ok` (`git cherry`)。
+#
+# 使い方:
+#   gwq-gc                 # dry-run (今いるリポジトリ)
+#   gwq-gc --apply         # 削除 (確認あり)
+#   gwq-gc --apply -y      # 削除 (確認なし)
+#   gwq-gc --squash-ok     # squash マージも候補にする
+#   gwq-gc --base origin/develop
+#   gwq-gc --no-fetch
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: gwq-gc [--apply] [-y] [--squash-ok] [--base <ref>] [--no-fetch]
+
+Remove gwq worktrees whose branch is merged into the base ref and whose
+working tree is clean (no uncommitted or untracked files).
+
+Default is dry-run. Pass --apply to call `gwq remove -b` (local branch only).
+
+  --apply         actually remove matching worktrees
+  -y, --yes       do not prompt before --apply
+  --squash-ok     treat git cherry (no unique patches vs base) as merged
+  --base <ref>    merge-base (default: origin/HEAD, else origin/main, else origin/develop)
+  --no-fetch      skip git fetch --prune origin
+  -h, --help      show this help
+
+Skipped: main worktree, main/master/develop, the current worktree, dirty trees,
+worktrees with active processes, and branches not merged by the chosen check.
+EOF
+}
+
+APPLY=0
+YES=0
+SQUASH_OK=0
+NO_FETCH=0
+BASE_OVERRIDE=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --apply) APPLY=1 ;;
+        -y | --yes) YES=1 ;;
+        --squash-ok) SQUASH_OK=1 ;;
+        --no-fetch) NO_FETCH=1 ;;
+        --base)
+            if [ $# -lt 2 ]; then
+                echo "gwq-gc: --base requires a ref" >&2
+                exit 2
+            fi
+            BASE_OVERRIDE="$2"
+            shift
+            ;;
+        --base=*) BASE_OVERRIDE="${1#--base=}" ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "gwq-gc: unknown argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+need_cmd() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "gwq-gc: required command not found: $1" >&2
+        exit 1
+    fi
+}
+
+need_cmd git
+need_cmd gwq
+need_cmd jq
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "gwq-gc: not inside a git repository" >&2
+    exit 1
+fi
+
+if [ "$NO_FETCH" -eq 0 ]; then
+    git fetch --prune origin
+fi
+
+resolve_base() {
+    local ref
+    if [ -n "$BASE_OVERRIDE" ]; then
+        printf '%s\n' "$BASE_OVERRIDE"
+        return
+    fi
+    if ref=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null); then
+        printf '%s\n' "$ref"
+        return
+    fi
+    if git rev-parse --verify --quiet origin/main >/dev/null; then
+        echo origin/main
+        return
+    fi
+    if git rev-parse --verify --quiet origin/develop >/dev/null; then
+        echo origin/develop
+        return
+    fi
+    echo "gwq-gc: cannot resolve default base (set --base)" >&2
+    exit 1
+}
+
+BASE=$(resolve_base)
+if ! git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null; then
+    echo "gwq-gc: base ref not found: $BASE" >&2
+    exit 1
+fi
+
+LIST_FILE=$(mktemp)
+STATUS_FILE=$(mktemp)
+trap 'rm -f "$LIST_FILE" "$STATUS_FILE"' EXIT
+gwq list --json >"$LIST_FILE"
+gwq status --json --no-fetch --show-processes >"$STATUS_FILE"
+
+is_protected_branch() {
+    case "$1" in
+        main | master | develop) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 0 = merged, 1 = not merged
+is_merged() {
+    local path="$1"
+    if git -C "$path" merge-base --is-ancestor HEAD "$BASE"; then
+        return 0
+    fi
+    if [ "$SQUASH_OK" -eq 0 ]; then
+        return 1
+    fi
+    # `+` 行が 1 つでもあればベースに無いパッチが残っている
+    if git -C "$path" cherry "$BASE" HEAD | grep -q '^+'; then
+        return 1
+    fi
+    return 0
+}
+
+# path \t branch \t is_main \t is_current \t status \t nproc \t dirty_counts
+ROWS=$(
+    jq -r --slurpfile list "$LIST_FILE" '
+        ([$list[0][] | {key: .path, value: .}] | from_entries) as $by
+        | (.worktrees // [])[]
+        | [
+            .path,
+            (.branch // ""),
+            (if ($by[.path].is_main // false) then "1" else "0" end),
+            (if .is_current then "1" else "0" end),
+            (.status // ""),
+            ((.active_processes // []) | length | tostring),
+            (
+                [
+                    .git_status.modified,
+                    .git_status.added,
+                    .git_status.deleted,
+                    .git_status.untracked,
+                    .git_status.staged,
+                    .git_status.conflicts
+                ]
+                | map(. // 0) | add | tostring
+            )
+          ]
+        | @tsv
+    ' "$STATUS_FILE"
+)
+
+CANDIDATES=()
+SKIPPED=0
+CANDIDATE_COUNT=0
+
+printf 'base: %s\n' "$BASE"
+if [ "$SQUASH_OK" -eq 1 ]; then
+    echo "merge check: ancestor or git cherry"
+else
+    echo "merge check: ancestor only"
+fi
+echo
+
+while IFS=$'\t' read -r path branch is_main is_current status nproc dirty_counts; do
+    [ -n "${path:-}" ] || continue
+    skip_reason=""
+    if [ "$is_main" = "1" ]; then
+        skip_reason="main-worktree"
+    elif [ -z "$branch" ]; then
+        skip_reason="detached"
+    elif is_protected_branch "$branch"; then
+        skip_reason="protected"
+    elif [ "$is_current" = "1" ]; then
+        skip_reason="current"
+    elif [ "$nproc" != "0" ]; then
+        skip_reason="processes"
+    elif [ "$status" != "clean" ] || [ "$dirty_counts" != "0" ]; then
+        skip_reason="dirty"
+    elif ! is_merged "$path"; then
+        skip_reason="not-merged"
+    fi
+
+    if [ -n "$skip_reason" ]; then
+        printf 'SKIP    %-12s  %s  %s\n' "$skip_reason" "$branch" "$path"
+        SKIPPED=$((SKIPPED + 1))
+        continue
+    fi
+
+    printf 'DELETE  %-12s  %s  %s\n' "merged+clean" "$branch" "$path"
+    CANDIDATES+=("$branch")
+    CANDIDATE_COUNT=$((CANDIDATE_COUNT + 1))
+done <<<"$ROWS"
+
+echo
+printf 'candidates: %s  skipped: %s\n' "$CANDIDATE_COUNT" "$SKIPPED"
+
+if [ "$APPLY" -eq 0 ]; then
+    echo "dry-run (pass --apply to remove)"
+    exit 0
+fi
+
+if [ "$CANDIDATE_COUNT" -eq 0 ]; then
+    echo "nothing to remove"
+    exit 0
+fi
+
+if [ "$YES" -eq 0 ]; then
+    if [ -t 0 ]; then
+        read -r -p "Remove ${CANDIDATE_COUNT} worktree(s) and local branch(es)? [y/N] " ans
+    elif [ -e /dev/tty ]; then
+        read -r -p "Remove ${CANDIDATE_COUNT} worktree(s) and local branch(es)? [y/N] " ans </dev/tty
+    else
+        echo "gwq-gc: refusing --apply without -y when there is no tty" >&2
+        exit 1
+    fi
+    case "$ans" in
+        y | Y | yes | YES) ;;
+        *)
+            echo "aborted"
+            exit 1
+            ;;
+    esac
+fi
+
+failed=0
+for branch in "${CANDIDATES[@]}"; do
+    if gwq remove -b "$branch"; then
+        printf 'removed  %s\n' "$branch"
+    else
+        printf 'failed   %s\n' "$branch" >&2
+        failed=1
+    fi
+done
+
+exit "$failed"
