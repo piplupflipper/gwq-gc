@@ -1,36 +1,38 @@
-# gwq-gc
+# gwq-gc 🧹💅
 
-[gwq](https://github.com/d-kuro/gwq) で作った worktree のうち、マージ済みで未コミットの変更が無いものを一括で削除するコマンドです。
+**English** | [日本語](README.ja.md)
 
-既定は dry-run で、`--apply` を付けたときだけ `gwq remove -b` を実行します。
-リモートブランチは削除しません。
+This command bulk-deletes the worktrees you made with [gwq](https://github.com/d-kuro/gwq) that are already merged and have no uncommitted changes 💖🧼✨
 
-## 必要なもの
+By default it's a dry-run, and it only runs `gwq remove -b` when you add `--apply` 🙆‍♀️  
+It never deletes remote branches, so don't worry 🫶
+
+## 🛍️ Requirements
 
 - bash
 - git
 - gwq
 
-## 導入
+## 📦 Install
 
 ```sh
 install -m 755 gwq-gc ~/.local/bin/gwq-gc
 ```
 
-## 使い方
+## 🎀 Usage
 
 ```sh
-gwq-gc                        # dry-run (今いるリポジトリ)
-gwq-gc --apply                # 確認してから削除
-gwq-gc --apply -y             # 確認せずに削除
-gwq-gc --squash-ok            # squash マージされたものも候補にする
-gwq-gc --base origin/develop  # 比較するブランチを指定
-gwq-gc --no-fetch             # fetch しない
+gwq-gc                        # dry-run (the repo you're in)
+gwq-gc --apply                # delete after asking
+gwq-gc --apply -y             # delete without asking
+gwq-gc --squash-ok            # also treat squash-merged ones as candidates
+gwq-gc --base origin/develop  # pick the branch to compare against
+gwq-gc --no-fetch             # don't fetch
 ```
 
-マージの判定は、既定ではブランチの先端が比較先の祖先かどうかで行います。
-比較先の既定は `origin/HEAD`、`origin/main`、`origin/develop` の順に探します。
+By default, a branch counts as merged when its tip is an ancestor of the comparison branch 🌳  
+If you don't pick one, it looks for `origin/HEAD`, `origin/main`, then `origin/develop`, in that order.
 
-## ライセンス
+## 📜 License
 
-MIT
+MIT 💖
